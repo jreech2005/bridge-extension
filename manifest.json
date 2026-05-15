@@ -42,10 +42,5 @@
       "resources": ["src/workers/*", "models/*"],
       "matches": ["https://claude.ai/*", "https://chatgpt.com/*", "https://chat.openai.com/*"]
     }
-  ],
-  "icons": {
-    "16": "public/icons/icon-16.png",
-    "48": "public/icons/icon-48.png",
-    "128": "public/icons/icon-128.png"
-  }
+  ]
 }
