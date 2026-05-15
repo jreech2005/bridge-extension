@@ -1,0 +1,1 @@
+// Claude content script entry
