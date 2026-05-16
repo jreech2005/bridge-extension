@@ -1,10 +1,13 @@
 import { ClaudeAdapter } from '@/adapters/claude';
 import { chunkTurn } from '@/shared/chunker';
 import {
+  db,
   deleteChunksFromTurn,
   upsertChunk,
   upsertConversation,
 } from '@/storage/db';
+import { embedInContentScript } from '@/embeddings/embedder-cs';
+import { startBackfill } from '@/embeddings/backfill';
 
 const adapter = new ClaudeAdapter();
 
@@ -26,6 +29,14 @@ adapter.onTurn(async (turn, edit) => {
     const chunks = chunkTurn({ ...turn, conversationId: conversationKey });
     for (const chunk of chunks) {
       await upsertChunk(chunk);
+      void embedInContentScript(chunk.combinedText)
+        .then(async (vector) => {
+          await db.chunks.update(chunk.id, { vector });
+          console.log('[bridge] embedded chunk', chunk.id);
+        })
+        .catch((err) => {
+          console.warn('[bridge] live embed failed for', chunk.id, err);
+        });
     }
     console.log(
       '[bridge] captured turn',
@@ -41,3 +52,4 @@ adapter.onTurn(async (turn, edit) => {
 });
 
 adapter.start();
+startBackfill();

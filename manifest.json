@@ -3,7 +3,7 @@
   "name": "Bridge",
   "version": "0.1.0",
   "description": "Local-first memory bridge across AI chat platforms.",
-  "permissions": ["storage", "tabs", "scripting", "alarms"],
+  "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [
     "https://claude.ai/*",
     "https://chatgpt.com/*",
@@ -39,7 +39,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["src/workers/*", "models/*"],
+      "resources": ["models/*"],
       "matches": ["https://claude.ai/*", "https://chatgpt.com/*", "https://chat.openai.com/*"]
     }
   ]
