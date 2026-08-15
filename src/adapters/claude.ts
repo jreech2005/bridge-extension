@@ -15,6 +15,8 @@ const SELECTORS = {
 
 const SIDEBAR_PROJECT_LINK_SELECTORS = [
   'nav a[href^="/project/"]',
+  'aside a[href^="/project/"]',
+  '[role="navigation"] a[href^="/project/"]',
   'a[href^="/project/"]',
 ];
 const CONVERSATION_TITLE_SELECTORS = [
@@ -23,6 +25,15 @@ const CONVERSATION_TITLE_SELECTORS = [
   'header h1',
   'header [class*="title"]',
   'button[data-testid*="conversation"] [class*="truncate"]',
+];
+
+// Breadcrumb / non-sidebar project anchors — strategy B reads the project name
+// from the top-of-page link the user sees while inside a /chat/<id> within a project.
+const BREADCRUMB_PROJECT_SELECTORS = [
+  'header a[href^="/project/"]',
+  'nav[aria-label*="breadcrumb" i] a[href^="/project/"]',
+  '[aria-label*="breadcrumb" i] a[href^="/project/"]',
+  'a[href^="/project/"]',
 ];
 
 const warnedLabels = new Set<string>();
@@ -114,6 +125,10 @@ export class ClaudeAdapter {
   private currentConversationId: string | null = null;
   private rootProbeTimer: ReturnType<typeof setInterval> | null = null;
   private locationListener: (() => void) | null = null;
+  private projectCache: ClaudeProject[] = [];
+  private dumpedDomForUrl = new Set<string>();
+  private projectScrapeObserver: MutationObserver | null = null;
+  private projectScrapeDebounce: ReturnType<typeof setTimeout> | null = null;
 
   onTurn(handler: TurnHandler): void {
     this.handler = handler;
@@ -124,7 +139,9 @@ export class ClaudeAdapter {
     this.locationListener = () => this.handleLocationChange();
     window.addEventListener(LOCATION_EVENT, this.locationListener);
 
+    void this.hydrateProjectCacheFromStorage();
     void this.refreshProjectList();
+    this.attachProjectScrapeObserver();
     this.handleLocationChange();
   }
 
@@ -133,7 +150,37 @@ export class ClaudeAdapter {
       window.removeEventListener(LOCATION_EVENT, this.locationListener);
       this.locationListener = null;
     }
+    if (this.projectScrapeObserver) {
+      this.projectScrapeObserver.disconnect();
+      this.projectScrapeObserver = null;
+    }
+    if (this.projectScrapeDebounce) {
+      clearTimeout(this.projectScrapeDebounce);
+      this.projectScrapeDebounce = null;
+    }
     this.disconnect();
+  }
+
+  private attachProjectScrapeObserver(): void {
+    if (this.projectScrapeObserver) return;
+    // The sidebar mounts asynchronously and can re-render as projects are
+    // added/renamed/loaded. Watch document.body and re-scrape on any structural
+    // change, debounced to keep cost down.
+    this.projectScrapeObserver = new MutationObserver(() => {
+      if (this.projectScrapeDebounce) return;
+      this.projectScrapeDebounce = setTimeout(() => {
+        this.projectScrapeDebounce = null;
+        void this.refreshProjectList();
+      }, 500);
+    });
+    try {
+      this.projectScrapeObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+    } catch (err) {
+      console.warn('[bridge] failed to attach project scrape observer', err);
+    }
   }
 
   getPageState(): PageState {
@@ -171,6 +218,8 @@ export class ClaudeAdapter {
     }
     this.disconnect();
     void this.refreshProjectList();
+    // Sidebar often mounts after the route resolves — retry once it's likely settled.
+    setTimeout(() => void this.refreshProjectList(), 1500);
     this.attachObserver();
   }
 
@@ -299,37 +348,135 @@ export class ClaudeAdapter {
   }
 
   private readActiveProjectName(): string | null {
-    const projectId = extractProjectIdFromUrl(location.href);
-    const links = safeQueryAll<HTMLAnchorElement>(document, SIDEBAR_PROJECT_LINK_SELECTORS);
+    const tried: string[] = [];
+    let result: string | null = null;
+    let winner: string | null = null;
 
-    if (projectId) {
-      for (const a of links) {
-        if (a.getAttribute('href')?.includes(`/project/${projectId}`)) {
-          const t = safeText(a);
-          if (t) return t;
+    // Strategy A: URL → cached project list by uuid.
+    const directProjectId = extractProjectIdFromUrl(location.href);
+    if (directProjectId) {
+      tried.push(`A: url /project/${directProjectId} → cache(${this.projectCache.length})`);
+      const hit = this.projectCache.find((p) => p.id === directProjectId);
+      if (hit?.name) {
+        result = hit.name;
+        winner = 'A';
+      }
+    } else {
+      tried.push('A: skipped (no /project/<uuid> in URL)');
+    }
+
+    // Strategy B: breadcrumb / non-sidebar project anchor.
+    if (!result) {
+      const convProjectId = this.findChatProjectIdInDom();
+      tried.push(
+        `B: breadcrumb anchor${convProjectId ? ` → uuid ${convProjectId}` : ''}`,
+      );
+      if (convProjectId) {
+        const cached = this.projectCache.find((p) => p.id === convProjectId);
+        if (cached?.name) {
+          result = cached.name;
+          winner = 'B(cache)';
+        }
+      }
+      if (!result) {
+        for (const sel of BREADCRUMB_PROJECT_SELECTORS) {
+          try {
+            const anchors = document.querySelectorAll<HTMLAnchorElement>(sel);
+            for (const a of anchors) {
+              // Skip sidebar anchors — those are handled by Strategy C.
+              if (a.closest('nav, aside, [role="navigation"]')) continue;
+              const name = safeText(a);
+              if (name) {
+                result = name;
+                winner = `B(${sel})`;
+                break;
+              }
+            }
+          } catch {
+            // skip bad selector
+          }
+          if (result) break;
         }
       }
     }
 
-    for (const a of links) {
-      if (
-        a.getAttribute('aria-current') === 'page' ||
-        a.getAttribute('aria-current') === 'true' ||
-        a.matches('[class*="active"], [class*="selected"]')
-      ) {
+    // Strategy C: sidebar entry marked as active/current.
+    if (!result) {
+      const sidebarLinks = safeQueryAll<HTMLAnchorElement>(
+        document,
+        SIDEBAR_PROJECT_LINK_SELECTORS,
+      );
+      tried.push(`C: sidebar active (${sidebarLinks.length} links)`);
+      for (const a of sidebarLinks) {
+        const current = a.getAttribute('aria-current');
+        const isActive =
+          current === 'page' ||
+          current === 'true' ||
+          a.matches('[class*="active"], [class*="selected"]');
+        if (!isActive) continue;
         const t = safeText(a);
-        if (t) return t;
+        if (t) {
+          result = t;
+          winner = 'C';
+          break;
+        }
       }
+    }
+
+    console.log(
+      `[bridge debug] project detection: tried ${tried.join(' | ')}, result: ${
+        result ?? 'null'
+      }${winner ? ` (strategy ${winner})` : ''}`,
+    );
+
+    if (!result && !this.dumpedDomForUrl.has(location.href)) {
+      this.dumpedDomForUrl.add(location.href);
+      const header = document.querySelector('header');
+      const sidebar =
+        document.querySelector('aside') ??
+        document.querySelector('nav') ??
+        document.querySelector('[role="navigation"]');
+      console.warn('[bridge debug] project detection: all strategies failed', {
+        url: location.href,
+        headerOuterHTML: header?.outerHTML?.slice(0, 4000) ?? null,
+        sidebarOuterHTML: sidebar?.outerHTML?.slice(0, 4000) ?? null,
+      });
+    }
+
+    return result;
+  }
+
+  // Returns the project uuid linked from a non-sidebar anchor (breadcrumb), if any.
+  private findChatProjectIdInDom(): string | null {
+    const anchors = document.querySelectorAll<HTMLAnchorElement>('a[href^="/project/"]');
+    for (const a of anchors) {
+      if (a.closest('nav, aside, [role="navigation"]')) continue;
+      const m = a.getAttribute('href')?.match(/\/project\/([0-9a-f-]{8,})/i);
+      if (m) return m[1] ?? null;
     }
     return null;
   }
 
+  private async hydrateProjectCacheFromStorage(): Promise<void> {
+    try {
+      if (typeof chrome === 'undefined' || !chrome.storage?.local) return;
+      const got = await chrome.storage.local.get(PROJECTS_STORAGE_KEY);
+      const list = (got?.[PROJECTS_STORAGE_KEY] as ClaudeProject[] | undefined) ?? [];
+      if (list.length > 0) this.projectCache = list;
+    } catch (err) {
+      console.warn('[bridge] project cache hydrate failed', err);
+    }
+  }
+
   private async refreshProjectList(): Promise<void> {
     try {
-      const links = safeQueryAll<HTMLAnchorElement>(document, SIDEBAR_PROJECT_LINK_SELECTORS);
+      // Broad scope: any project anchor anywhere in the document. The sidebar
+      // markup churns (nav vs aside vs role=navigation), but the href pattern
+      // is stable. Dedupe by uuid handles breadcrumb/sidebar overlap.
+      const anchors = document.querySelectorAll<HTMLAnchorElement>('a[href^="/project/"]');
       const seen = new Set<string>();
       const projects: ClaudeProject[] = [];
-      for (const a of links) {
+      for (const a of anchors) {
         const href = a.getAttribute('href') ?? '';
         const id = href.match(/\/project\/([^/?#]+)/)?.[1];
         if (!id || seen.has(id)) continue;
@@ -338,9 +485,23 @@ export class ClaudeAdapter {
         seen.add(id);
         projects.push({ id, name, url: new URL(href, location.origin).toString() });
       }
+
+      console.log(
+        `[bridge debug] project list scrape: found ${projects.length} projects:`,
+        projects.map((p) => p.name),
+      );
+
       if (projects.length === 0) return;
+
+      // Merge new findings into the in-memory cache so previously-seen projects
+      // survive page states where the sidebar collapses or hides them.
+      const merged = new Map<string, ClaudeProject>();
+      for (const p of this.projectCache) merged.set(p.id, p);
+      for (const p of projects) merged.set(p.id, p);
+      this.projectCache = Array.from(merged.values());
+
       if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-        await chrome.storage.local.set({ [PROJECTS_STORAGE_KEY]: projects });
+        await chrome.storage.local.set({ [PROJECTS_STORAGE_KEY]: this.projectCache });
       }
     } catch (err) {
       console.warn('[bridge] project list refresh failed', err);

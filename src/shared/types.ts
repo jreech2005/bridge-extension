@@ -49,3 +49,18 @@ export interface ClaudeProject {
   name: string;
   url: string;
 }
+
+export type TriggerSource =
+  | { type: 'platform'; platform: string }
+  | { type: 'project'; project: string };
+
+export interface TriggerMatch {
+  source: TriggerSource;
+  matchedText: string;
+}
+
+export interface SearchResult {
+  chunk: Chunk;
+  conversation: Conversation;
+  score: number;
+}
